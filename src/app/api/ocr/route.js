@@ -1,48 +1,60 @@
 import { DocumentProcessorServiceClient } from '@google-cloud/documentai';
-import { Dropbox } from 'dropbox';
 
 export async function POST(request) {
-  // Get the file path from the request
-  // (this comes from the scan results — each file has a path)
   const { filePath } = await request.json();
+  const token = process.env.DROPBOX_ACCESS_TOKEN;
 
-  // ---- STEP 1: Download the PDF from Dropbox ----
-  const dbx = new Dropbox({
-    accessToken: process.env.DROPBOX_ACCESS_TOKEN
-  });
+  try {
+    // 1. Download PDF from Dropbox using native fetch
+    const downloadRes = await fetch(
+      'https://content.dropboxapi.com/2/files/download',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Dropbox-API-Arg': JSON.stringify({ path: filePath }),
+        },
+      }
+    );
 
-  const file = await dbx.filesDownload({ path: filePath });
+    if (!downloadRes.ok) {
+      return Response.json(
+        { error: `Dropbox download failed: ${downloadRes.statusText}` },
+        { status: 400 }
+      );
+    }
 
-  // fileBinary is the raw PDF bytes
-  const buffer = file.result.fileBinary;
+    const fileBuffer = await downloadRes.arrayBuffer();
 
-  // ---- STEP 2: Send to Google Document AI for OCR ----
-  const client = new DocumentProcessorServiceClient({
-    keyFilename: process.env.GOOGLE_CREDENTIALS
-  });
+    // 2. Send to Google Document AI for OCR
+    const client = new DocumentProcessorServiceClient({
+      keyFilename: process.env.GOOGLE_CREDENTIALS,
+    });
 
-  // This long string tells Google which processor to use
-  // It combines your project ID, location, and processor ID
-  const processorName =
-    `projects/${process.env.GOOGLE_PROJECT_ID}` +
-    `/locations/us` +
-    `/processors/${process.env.GOOGLE_PROCESSOR_ID}`;
+    const processorName =
+      `projects/${process.env.GOOGLE_PROJECT_ID}` +
+      `/locations/us` +
+      `/processors/${process.env.GOOGLE_PROCESSOR_ID}`;
 
-  const [result] = await client.processDocument({
-    name: processorName,
-    rawDocument: {
-      // Convert the PDF bytes to base64 (Google requires this format)
-      content: Buffer.from(buffer).toString('base64'),
-      mimeType: 'application/pdf',
-    },
-  });
+    const [result] = await client.processDocument({
+      name: processorName,
+      rawDocument: {
+        content: Buffer.from(fileBuffer).toString('base64'),
+        mimeType: 'application/pdf',
+      },
+    });
 
-  // ---- STEP 3: Pull out the text ----
-  const extractedText = result.document.text;
+    const text = result.document.text;
 
-  return Response.json({
-    success: true,
-    text: extractedText,
-    pageCount: result.document.pages.length
-  });
+    return Response.json({
+      success: true,
+      text: text,
+      pageCount: result.document.pages.length,
+    });
+  } catch (error) {
+    return Response.json(
+      { error: error.message },
+      { status: 500 }
+    );
+  }
 }
