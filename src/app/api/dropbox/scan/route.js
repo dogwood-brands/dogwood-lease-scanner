@@ -6,7 +6,7 @@ export async function POST() {
   });
 
   // Recursively find all PDFs in your entire Dropbox
-  async function findPDFs(path = '') {
+  async function findPDFs(path = '/Leasecake Data Dump Supercuts') {
     let files = [];
     let result = await dbx.filesListFolder({
       path: path,
