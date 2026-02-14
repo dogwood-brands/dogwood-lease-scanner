@@ -1,155 +1,154 @@
+// src/app/api/classify/route.js
+// Updated: Now saves classification results to Neon Postgres
 import Anthropic from '@anthropic-ai/sdk';
-import { promises as fs } from 'fs';
-import path from 'path';
+import sql from '@/lib/db';
 
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
-
-let storeMemory = null;
-async function loadMemory() {
-  if (storeMemory) return storeMemory;
-  try {
-    const filePath = path.join(process.cwd(), 'data', 'store-memory.json');
-    const raw = await fs.readFile(filePath, 'utf-8');
-    storeMemory = JSON.parse(raw);
-    return storeMemory;
-  } catch {
-    return [];
-  }
-}
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 export async function POST(request) {
-  const { ocrText, fileName, folderPath, existingLeases } = await request.json();
-
-  const memory = await loadMemory();
-
-  const storeDirectory = memory.map(s =>
-    `Salon #${s.salon_number} | Entity: ${s.entity} | Name: ${s.store_name} | ` +
-    `Center: ${s.shopping_center} | ${s.address}, ${s.city}, ${s.state} ${s.zip} | ` +
-    `LED: ${s.led} | Internal: ${s.internal_name}`
-  ).join("\n");
-
-  let sessionContext = "";
-  if (existingLeases && existingLeases.length > 0) {
-    sessionContext = `
-
-PREVIOUSLY CLASSIFIED IN THIS SESSION (match new docs to these if same location):
-${existingLeases.map(l =>
-  `- Salon #${l.salon_number || l.store} | Entity: ${l.entity} | Address: ${l.address} | Landlord: ${l.landlord} | Center: ${l.center}`
-).join("\n")}`;
-  }
-
-  let folderContext = "";
-  if (folderPath) {
-    folderContext = `\nDropbox path: ${folderPath}`;
-  }
-
-  const message = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 3000,
-    messages: [
-      {
-        role: 'user',
-        content: `You are an expert real estate document classifier for Dogwood Brands, a private equity firm operating Supercuts salon locations.
-
-YOUR STORE DIRECTORY (this is your memory — match documents to these known stores):
-${storeDirectory}
-
-ENTITY KEY:
-- SC-31 = Southern California stores (29 locations)
-- SC-3 = Additional California stores (3 locations)
-- SD-06 = San Diego area stores (4 locations)
-- LV-14 = Las Vegas stores (12 locations)
-- EE-1 = Additional Las Vegas stores (4 locations)
-- PHX-06 = Phoenix area stores (6 locations)
-${sessionContext}
-
-CRITICAL MATCHING RULES:
-1. ALWAYS try to match the document to a known store from the directory above
-2. Match by address — even partial matches (e.g. "12218 Apple Valley Rd" matches salon #80660)
-3. Match by shopping center name (e.g. "Apple Valley Village" matches salon #80660)
-4. Match by salon/store number if mentioned in the document
-5. Match by city + street name as a fallback
-6. The entity MUST match the store directory (e.g. salon #80660 is entity SC-31)
-7. If you cannot match to any known store, flag it clearly in classification_notes
-${folderContext}
-
-DOCUMENT TYPES:
-- "Original Lease" = initial lease agreement
-- "Amendment #N" = amendments (First Amendment = #1, Second = #2, etc.)
-- "Renewal" = formal renewal agreement
-- "Assignment" = lease assignment
-- "Sublease" = sublease agreement
-- "Estoppel Certificate" = estoppel
-- "SNDA" = subordination, non-disturbance, and attornment agreement
-- "Insurance" = certificate of insurance
-- "Correspondence" = letters, notices
-- "Guaranty" = personal or corporate guaranty
-- "Memorandum of Lease" = recorded memorandum
-- "Other" = anything else
-
-Return ONLY a valid JSON object — no markdown, no backticks:
-
-{
-  "entity_name": "entity code from directory (SC-31, LV-14, etc.)",
-  "salon_number": number from directory match or 0 if unmatched,
-  "store_name": "store name from directory or from document",
-  "store_number_source": "matched_directory" or "found_in_document" or "unmatched",
-  "document_type": "type from list above",
-  "document_date": "YYYY-MM-DD",
-  "property_address": "full address from document",
-  "shopping_center": "center name",
-  "market": "Southern California" or "San Diego" or "Las Vegas" or "Phoenix" or other,
-  "landlord_name": "landlord entity",
-  "landlord_contact": "contact info if found",
-  "lease_start_date": "YYYY-MM-DD",
-  "lease_end_date": "YYYY-MM-DD",
-  "monthly_base_rent": number or 0,
-  "monthly_cam": number or 0,
-  "square_footage": number or 0,
-  "renewal_options": "description",
-  "key_terms": "escalation, co-tenancy, exclusives, kick-out, personal guaranty, etc.",
-  "amendment_summary": "what changed if amendment",
-  "references_documents": "other docs referenced",
-  "suggested_folder": "/Dogwood/[entity]/[salon_number]-[store_name]/",
-  "suggested_filename": "Original-Lease.pdf or Amendment-01.pdf etc",
-  "confidence": 0-100,
-  "classification_notes": "explain how you matched this to a store, or why you couldn't"
-}
-
-Rules:
-- For monthly_base_rent: if annual rent, divide by 12
-- Empty string for text not found, 0 for numbers not found
-- Lower confidence if match is uncertain
-- ALWAYS explain matching reasoning in classification_notes
-
-File name: ${fileName}
-
-Document text:
-${ocrText.substring(0, 20000)}`
-      }
-    ]
-  });
-
-  const responseText = message.content[0].text;
-  const cleaned = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
-
   try {
-    const data = JSON.parse(cleaned);
-    return Response.json({ success: true, classification: data });
-  } catch (parseError) {
-    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      try {
-        const data = JSON.parse(jsonMatch[0]);
-        return Response.json({ success: true, classification: data });
-      } catch (e) { /* fall through */ }
+    const body = await request.json();
+    const { ocrText, fileName, filePath, dropboxLink, storeMemory } = body;
+
+    // ─── Step 1: AI Classification ───
+    const systemPrompt = `You are a real estate document classifier for Dogwood Brands, a private equity company that operates Supercuts salon locations. 
+
+Given OCR text from a document, classify it and extract key information.
+
+${storeMemory ? `STORE DIRECTORY (use this to match documents to locations):
+${JSON.stringify(storeMemory, null, 2)}` : ''}
+
+Respond in JSON only, no markdown:
+{
+  "document_type": "Original Lease | Amendment #N | Estoppel Certificate | LOI | Lease Abstract | Rent Schedule | CAM Reconciliation | Termination Notice | Renewal Notice | Correspondence | Insurance Certificate | Other",
+  "entity": "entity code like SC-31, SD-06, LV-14, etc.",
+  "store_number": "store number if found",
+  "salon_number": "salon number if found",
+  "property_address": "full address if found",
+  "city": "city",
+  "state": "state abbreviation",
+  "zip": "zip code",
+  "shopping_center": "shopping center name if found",
+  "landlord": "landlord name if found",
+  "document_date": "YYYY-MM-DD if found, null otherwise",
+  "lease_start": "YYYY-MM-DD if found",
+  "lease_end": "YYYY-MM-DD if found",
+  "monthly_rent": null or number,
+  "sqft": null or number,
+  "key_terms": "brief summary of notable terms",
+  "confidence": 0-100
+}`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      system: systemPrompt,
+      messages: [{ 
+        role: 'user', 
+        content: `Classify this document.\n\nFile name: ${fileName}\nFile path: ${filePath}\n\nOCR Text (first 3000 chars):\n${(ocrText || '').substring(0, 3000)}` 
+      }]
+    });
+
+    const responseText = message.content[0].text;
+    let classification;
+    try {
+      classification = JSON.parse(responseText.replace(/```json\n?|```/g, '').trim());
+    } catch {
+      classification = { document_type: 'Unknown', confidence: 0, raw: responseText };
     }
+
+    // ─── Step 2: Find or create the lease in the database ───
+    let leaseId = null;
+
+    if (classification.store_number || classification.property_address) {
+      // Try to find existing lease by store number first
+      if (classification.store_number) {
+        const existing = await sql`
+          SELECT id FROM leases WHERE store_number = ${classification.store_number} LIMIT 1
+        `;
+        if (existing.length > 0) {
+          leaseId = existing[0].id;
+        }
+      }
+
+      // Try by address if no store match
+      if (!leaseId && classification.property_address) {
+        const existing = await sql`
+          SELECT id FROM leases WHERE address ILIKE ${`%${classification.property_address}%`} LIMIT 1
+        `;
+        if (existing.length > 0) {
+          leaseId = existing[0].id;
+        }
+      }
+
+      // Create new lease if not found and we have enough info
+      if (!leaseId && classification.document_type !== 'Unknown') {
+        const newLease = await sql`
+          INSERT INTO leases (
+            store_number, location_name, salon_number,
+            address, city, state, zip,
+            shopping_center, entity,
+            landlord,
+            lease_start, lease_end,
+            monthly_rent, sqft,
+            latest_amendment, amendment_date,
+            status, key_terms, dropbox_folder
+          ) VALUES (
+            ${classification.store_number || 'TBD'},
+            ${classification.shopping_center ? `Supercuts - ${classification.shopping_center}` : null},
+            ${classification.salon_number},
+            ${classification.property_address},
+            ${classification.city}, ${classification.state}, ${classification.zip},
+            ${classification.shopping_center}, ${classification.entity},
+            ${classification.landlord},
+            ${classification.lease_start}, ${classification.lease_end},
+            ${classification.monthly_rent}, ${classification.sqft},
+            ${classification.document_type.includes('Amendment') ? classification.document_type : 'Original Lease'},
+            ${classification.document_date},
+            'active',
+            ${classification.key_terms},
+            ${filePath ? filePath.split('/').slice(0, -1).join('/') : null}
+          )
+          RETURNING id
+        `;
+        leaseId = newLease[0].id;
+      }
+    }
+
+    // ─── Step 3: Save the document record ───
+    const doc = await sql`
+      INSERT INTO documents (
+        lease_id, file_name, original_path, doc_type, doc_date,
+        confidence, ai_classification, ocr_text, ocr_processed, dropbox_link
+      ) VALUES (
+        ${leaseId}, ${fileName}, ${filePath}, 
+        ${classification.document_type}, ${classification.document_date},
+        ${classification.confidence}, ${JSON.stringify(classification)},
+        ${(ocrText || '').substring(0, 50000)}, true, ${dropboxLink}
+      )
+      RETURNING *
+    `;
+
+    // ─── Step 4: Update lease if this is an amendment ───
+    if (leaseId && classification.document_type && classification.document_type.includes('Amendment')) {
+      await sql`
+        UPDATE leases 
+        SET latest_amendment = ${classification.document_type},
+            amendment_date = ${classification.document_date}
+        WHERE id = ${leaseId}
+      `;
+    }
+
     return Response.json({
-      success: false,
-      error: 'Failed to parse AI response',
-      rawResponse: responseText
-    }, { status: 422 });
+      ...classification,
+      lease_id: leaseId,
+      document_id: doc[0].id,
+      saved_to_db: true,
+      file: fileName
+    });
+
+  } catch (error) {
+    console.error('Classify error:', error);
+    return Response.json({ error: error.message }, { status: 500 });
   }
 }
