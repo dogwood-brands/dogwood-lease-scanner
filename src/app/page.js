@@ -11,7 +11,7 @@ function Badge({ status }) {
 function Conf({ v }) { return <span style={{ fontSize: 11, fontWeight: 600, color: v >= 90 ? "#22c55e" : v >= 80 ? "#fbbf24" : "#ef4444" }}>{v}%</span>; }
 
 export default function App() {
-  const [view, setView] = useState("scan");
+  const [view, setView] = useState("portfolio");
   const [phase, setPhase] = useState("idle");
   const [progress, setProgress] = useState(0);
   const [scanLog, setScanLog] = useState([]);
@@ -29,6 +29,7 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false);
   const [selectedLease, setSelectedLease] = useState(null);
   const [selectedEntity, setSelectedEntity] = useState("all");
+  const [loading, setLoading] = useState(true);
   // ═══ MEMORY STATE ═══
   const [memory, setMemory] = useState({ stores: [], entities: [], totalStores: 0, loaded: false });
   const fileRef = useRef(null);
@@ -44,6 +45,79 @@ export default function App() {
       }
     }).catch(() => setMemory(prev => ({ ...prev, loaded: true })));
   }, []);
+
+  // ═══ LOAD LEASES FROM DATABASE ON STARTUP ═══
+  useEffect(() => {
+    loadLeasesFromDB();
+  }, []);
+
+  async function loadLeasesFromDB() {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/leases');
+      const data = await res.json();
+      if (data.leases && data.leases.length > 0) {
+        const transformed = data.leases.map(l => ({
+          id: l.id,
+          salon_number: Number(l.salon_number) || 0,
+          store: l.store_number || String(l.salon_number || ''),
+          storeName: (l.location_name || '').replace(/^SUPERCUTS - /, '').replace(/^SMARTSTYLE - /, ''),
+          address: [l.address, l.city, l.state, l.zip].filter(Boolean).join(', '),
+          center: l.shopping_center || '',
+          landlord: l.landlord || '',
+          landlordContact: l.landlord_contact || '',
+          rent: Number(l.monthly_rent) || 0,
+          cam: Number(l.monthly_cam) || 0,
+          sqft: Number(l.sqft) || 0,
+          date: l.lease_start || '',
+          endDate: l.lease_end || '',
+          renewal: l.renewal_options || '',
+          keyTerms: l.key_terms || '',
+          entity: l.entity || 'Unknown',
+          market: l.market || '',
+          led: l.led_date || '',
+          sales2024: Number(l.annual_sales_2024) || 0,
+          phone: (l.notes || '').replace('Phone: ', ''),
+          status: getStatus(l.lease_end || l.led_date),
+          latestAmend: l.latest_amendment || 'Original Lease',
+          latestDate: l.amendment_date || '',
+          dropboxFolder: l.dropbox_folder || '',
+          documentCount: Number(l.document_count) || 0,
+          docs: [],
+          // Keep raw DB fields for updates
+          _dbId: l.id,
+        }));
+
+        // Load documents for all leases
+        try {
+          const docsRes = await fetch('/api/documents');
+          const docsData = await docsRes.json();
+          if (docsData.documents) {
+            docsData.documents.forEach(doc => {
+              const lease = transformed.find(l => l._dbId === doc.lease_id);
+              if (lease) {
+                lease.docs.push({
+                  file: doc.file_name,
+                  type: doc.doc_type || 'Unknown',
+                  date: doc.doc_date || '',
+                  confidence: doc.confidence || 0,
+                });
+              }
+            });
+          }
+        } catch (e) {
+          console.log('Could not load documents:', e);
+        }
+
+        setLeases(transformed);
+        // If we have data, default to portfolio view
+        if (transformed.length > 0) setView("portfolio");
+      }
+    } catch (err) {
+      console.error('Failed to load leases:', err);
+    }
+    setLoading(false);
+  }
 
   const gold = "#A38252";
   const show = (m, t = "success") => { setToast({ m, t }); setTimeout(() => setToast(null), 3500); };
@@ -133,21 +207,24 @@ export default function App() {
         const classRes = await fetch("/api/classify", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ocrText: ocrData.text, fileName: file.name, folderPath: file.folder || file.path, existingLeases: sessionCtx }),
+          body: JSON.stringify({ ocrText: ocrData.text, fileName: file.name, filePath: file.path, dropboxLink: file.path, folderPath: file.folder || file.path, existingLeases: sessionCtx }),
         });
         const classData = await classRes.json();
 
-        if (classData.success) {
-          const c = classData.classification;
+        // The classify route now saves to DB automatically
+        const savedToDb = classData.saved_to_db || false;
+
+        if (classData.document_type || (classData.success && classData.classification)) {
+          const c = classData.classification || classData;
           // Enrich with memory data if matched
           const memStore = getMemoryStore(c.salon_number);
           const result = {
             ...c,
-            entity: c.entity_name || (memStore ? memStore.entity : "Unknown"),
+            entity: c.entity_name || c.entity || (memStore ? memStore.entity : "Unknown"),
             salon_number: c.salon_number || 0,
             store: c.salon_number ? String(c.salon_number) : (c.store_name || ""),
             storeName: c.store_name || (memStore ? memStore.store_name : ""),
-            storeSource: c.store_number_source || "unmatched",
+            storeSource: c.store_number_source || (savedToDb ? "matched_directory" : "unmatched"),
             suggestedFolder: c.suggested_folder || "",
             suggestedFilename: c.suggested_filename || "",
             classNotes: c.classification_notes || "",
@@ -157,14 +234,19 @@ export default function App() {
             file: file.name,
             path: file.path,
             folder: file.folder,
+            savedToDb,
+            leaseId: classData.lease_id || null,
+            documentId: classData.document_id || null,
           };
           classified.push(result);
           setResults(prev => [...prev, result]);
 
           const matchIcon = result.storeSource === "matched_directory" ? "🎯" : result.storeSource === "found_in_document" ? "📄" : "⚠️";
-          addLog(`  ${matchIcon} Salon #${result.salon_number || "?"} → ${result.entity} / ${result.storeName}`, "success");
+          const dbIcon = savedToDb ? " 💾" : "";
+          addLog(`  ${matchIcon} Salon #${result.salon_number || "?"} → ${result.entity} / ${result.storeName}${dbIcon}`, "success");
           addLog(`  ✓ ${result.document_type} | ${result.property_address || "—"}`, "success");
           addLog(`  ✓ Confidence: ${result.confidence}% (${result.storeSource})`, result.confidence >= 85 ? "success" : "error");
+          if (savedToDb) addLog(`  💾 Saved to database`, "detail");
           if (result.classNotes) addLog(`  → ${result.classNotes}`, "detail");
         } else {
           addLog(`  ✗ Failed: ${classData.error || "Unknown"}`, "error");
@@ -175,6 +257,8 @@ export default function App() {
     setProgress(100);
     addLog("", "divider");
     addLog(`Done! ${classified.length}/${files.length} classified.`, "system");
+    const savedCount = classified.filter(c => c.savedToDb).length;
+    addLog(`${savedCount} saved to database automatically`, "system");
     const matched = classified.filter(c => c.storeSource === "matched_directory").length;
     addLog(`${matched} matched to store directory, ${classified.length - matched} unmatched or document-only`, "system");
     const ents = [...new Set(classified.map(c => c.entity))];
@@ -182,121 +266,122 @@ export default function App() {
     setPhase("review");
   }
 
-  // ═══ APPROVE ═══
-  function approveResults() {
-    const grouped = {};
-    results.forEach(r => {
-      const key = r.salon_number ? String(r.salon_number) : (r.property_address || r.file);
-      if (!grouped[key]) {
-        const mem = getMemoryStore(r.salon_number);
-        grouped[key] = {
-          salon_number: r.salon_number || 0,
-          store: r.salon_number ? String(r.salon_number) : "",
-          storeName: r.storeName || r.store_name || "",
-          address: r.property_address || (mem ? `${mem.address}, ${mem.city}, ${mem.state} ${mem.zip}` : ""),
-          center: r.shopping_center || (mem ? mem.shopping_center : ""),
-          landlord: r.landlord_name || "", landlordContact: r.landlord_contact || "",
-          rent: Number(r.monthly_base_rent) || 0, cam: Number(r.monthly_cam) || 0,
-          sqft: Number(r.square_footage) || 0,
-          date: r.lease_start_date || "", endDate: r.lease_end_date || "",
-          renewal: r.renewal_options || "", keyTerms: r.key_terms || "",
-          entity: r.entity || (mem ? mem.entity : "Unknown"),
-          market: r.market || "", suggestedFolder: r.suggestedFolder || "",
-          led: r.led || (mem ? mem.led : ""),
-          sales2024: r.sales2024 || (mem ? mem.sales_2024 : 0),
-          phone: r.phone || (mem ? mem.phone : ""),
-          docs: [], latestAmend: r.document_type || "",
-          latestDate: r.document_date || r.lease_start_date || "",
-          status: getStatus(r.lease_end_date),
-        };
-      }
-      grouped[key].docs.push({
-        file: r.file, type: r.document_type || "",
-        date: r.document_date || r.lease_start_date || "",
-        confidence: r.confidence, suggestedFilename: r.suggestedFilename || "",
-        amendmentSummary: r.amendment_summary || "",
-      });
-      if ((r.document_type || "").includes("Amendment")) {
-        const d = r.document_date || r.lease_start_date || "";
-        if (d > (grouped[key].latestDate || "")) {
-          grouped[key].latestAmend = r.document_type; grouped[key].latestDate = d;
-          if (r.monthly_base_rent) grouped[key].rent = Number(r.monthly_base_rent);
-          if (r.monthly_cam) grouped[key].cam = Number(r.monthly_cam);
-          if (r.lease_end_date) { grouped[key].endDate = r.lease_end_date; grouped[key].status = getStatus(r.lease_end_date); }
-        }
-      }
-    });
-    setLeases(prev => {
-      const merged = [...prev];
-      Object.values(grouped).forEach(nl => {
-        const idx = merged.findIndex(m => m.salon_number === nl.salon_number && nl.salon_number);
-        if (idx >= 0) merged[idx] = { ...merged[idx], ...nl, docs: [...merged[idx].docs, ...nl.docs] };
-        else merged.push(nl);
-      });
-      return merged;
-    });
+  // ═══ APPROVE — now reloads from database ═══
+  async function approveResults() {
+    show("Loading portfolio from database...");
+    // Reload from DB since classify route already saved everything
+    await loadLeasesFromDB();
     setView("portfolio");
-    show(`${Object.keys(grouped).length} locations organized`);
+    show(`Portfolio updated with ${results.length} new documents`);
   }
 
-  // ═══ UPLOAD ═══
+  // ═══ UPLOAD — now uses /api/upload for full pipeline ═══
   async function handleUpload(file) {
     if (!file) return;
     setUploadFile(file); setUploadFileName(file.name); setUploadPhase("processing");
     try {
-      const formData = new FormData(); formData.append("file", file);
-      const ocrRes = await fetch("/api/ocr-upload", { method: "POST", body: formData });
-      const ocrData = await ocrRes.json();
-      if (ocrData.success && ocrData.text) {
-        const ctx = buildSessionContext([]);
-        const classRes = await fetch("/api/classify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ocrText: ocrData.text, fileName: file.name, existingLeases: ctx }) });
-        const classData = await classRes.json();
-        if (classData.success) {
-          const c = classData.classification;
-          const mem = getMemoryStore(c.salon_number);
-          setUploadData({
-            entity: c.entity_name || "", salon_number: c.salon_number || "",
-            storeName: c.store_name || (mem ? mem.store_name : ""),
-            address: c.property_address || "", center: c.shopping_center || "",
-            landlord: c.landlord_name || "", landlordContact: c.landlord_contact || "",
-            type: c.document_type || "Original Lease",
-            date: c.document_date || c.lease_start_date || "", endDate: c.lease_end_date || "",
-            rent: c.monthly_base_rent || "", cam: c.monthly_cam || "",
-            sqft: c.square_footage || "", market: c.market || "",
-            renewal: c.renewal_options || "", keyTerms: c.key_terms || "",
-            suggestedFolder: c.suggested_folder || "", suggestedFilename: c.suggested_filename || "",
-            confidence: c.confidence || 0, classNotes: c.classification_notes || "",
-            storeSource: c.store_number_source || "",
-          });
-          setUploadPhase("review"); return;
-        }
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const res = await fetch("/api/upload", { method: "POST", body: formData });
+      const result = await res.json();
+
+      if (result.error) {
+        throw new Error(result.error);
       }
-      setUploadData({ entity: "", salon_number: "", storeName: "", address: "", center: "", landlord: "", landlordContact: "", type: "Original Lease", date: "", endDate: "", rent: "", cam: "", sqft: "", market: "", renewal: "", keyTerms: "", suggestedFolder: "", suggestedFilename: "", confidence: 0, classNotes: "Manual entry" });
-      setUploadPhase("review");
+
+      const c = result.classification || {};
+      const mem = getMemoryStore(c.salon_number);
+      setUploadData({
+        entity: c.entity || "", salon_number: c.salon_number || "",
+        storeName: c.store_name || c.shopping_center || (mem ? mem.store_name : ""),
+        address: c.property_address || "", center: c.shopping_center || "",
+        landlord: c.landlord || c.landlord_name || "", landlordContact: c.landlord_contact || "",
+        type: c.document_type || "Original Lease",
+        date: c.document_date || c.lease_start || "", endDate: c.lease_end || "",
+        rent: c.monthly_rent || "", cam: c.monthly_cam || "",
+        sqft: c.sqft || "", market: c.market || "",
+        renewal: c.renewal_options || "", keyTerms: c.key_terms || "",
+        suggestedFolder: c.suggested_folder || "", suggestedFilename: c.suggested_filename || "",
+        confidence: c.confidence || 0, classNotes: c.classification_notes || c.key_terms || "",
+        storeSource: c.store_number_source || (result.lease_id ? "matched" : ""),
+        // DB IDs from the upload response
+        _leaseId: result.lease_id,
+        _documentId: result.document?.id,
+        _savedToDb: result.success,
+      });
+      setUploadPhase("review"); return;
     } catch (err) {
-      setUploadData({ entity: "", salon_number: "", storeName: "", address: "", center: "", landlord: "", landlordContact: "", type: "Original Lease", date: "", endDate: "", rent: "", cam: "", sqft: "", market: "", renewal: "", keyTerms: "", suggestedFolder: "", suggestedFilename: "", confidence: 0, classNotes: err.message });
+      // Fallback to manual entry if upload pipeline fails
+      setUploadData({ entity: "", salon_number: "", storeName: "", address: "", center: "", landlord: "", landlordContact: "", type: "Original Lease", date: "", endDate: "", rent: "", cam: "", sqft: "", market: "", renewal: "", keyTerms: "", suggestedFolder: "", suggestedFilename: "", confidence: 0, classNotes: err.message, _savedToDb: false });
       setUploadPhase("review");
     }
   }
 
-  function saveUpload() {
-    const mem = getMemoryStore(uploadData.salon_number);
-    const nl = {
-      ...uploadData, salon_number: Number(uploadData.salon_number) || 0,
-      store: String(uploadData.salon_number || ""),
-      rent: Number(uploadData.rent) || 0, cam: Number(uploadData.cam) || 0,
-      sqft: Number(uploadData.sqft) || 0, status: uploadData.endDate ? getStatus(uploadData.endDate) : "active",
-      led: mem ? mem.led : "", sales2024: mem ? mem.sales_2024 : 0, phone: mem ? mem.phone : "",
-      docs: [{ file: uploadFileName, type: uploadData.type, date: uploadData.date, confidence: uploadData.confidence }],
-      latestAmend: uploadData.type, latestDate: uploadData.date, entity: uploadData.entity || "Unknown",
-    };
-    setLeases(prev => {
-      const idx = prev.findIndex(l => l.salon_number === nl.salon_number && nl.salon_number);
-      if (idx >= 0) { const u = [...prev]; u[idx] = { ...u[idx], ...nl, docs: [...u[idx].docs, ...nl.docs] }; return u; }
-      return [nl, ...prev];
-    });
+  async function saveUpload() {
+    // If already saved to DB by /api/upload, just update any edited fields
+    if (uploadData._savedToDb && uploadData._leaseId) {
+      try {
+        await fetch(`/api/leases/${uploadData._leaseId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            entity: uploadData.entity || undefined,
+            landlord: uploadData.landlord || undefined,
+            landlord_contact: uploadData.landlordContact || undefined,
+            monthly_rent: Number(uploadData.rent) || undefined,
+            monthly_cam: Number(uploadData.cam) || undefined,
+            sqft: Number(uploadData.sqft) || undefined,
+            lease_start: uploadData.date || undefined,
+            lease_end: uploadData.endDate || undefined,
+            renewal_options: uploadData.renewal || undefined,
+            key_terms: uploadData.keyTerms || undefined,
+            market: uploadData.market || undefined,
+            latest_amendment: uploadData.type || undefined,
+            amendment_date: uploadData.date || undefined,
+          }),
+        });
+      } catch (e) {
+        console.error('Failed to update lease:', e);
+      }
+    } else {
+      // Not yet saved — save manually to DB
+      try {
+        await fetch('/api/leases', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            store_number: String(uploadData.salon_number || 'TBD'),
+            location_name: uploadData.storeName ? `SUPERCUTS - ${uploadData.storeName}` : null,
+            salon_number: String(uploadData.salon_number || ''),
+            address: uploadData.address,
+            shopping_center: uploadData.center,
+            entity: uploadData.entity,
+            landlord: uploadData.landlord,
+            landlord_contact: uploadData.landlordContact,
+            lease_start: uploadData.date || null,
+            lease_end: uploadData.endDate || null,
+            monthly_rent: Number(uploadData.rent) || null,
+            monthly_cam: Number(uploadData.cam) || null,
+            sqft: Number(uploadData.sqft) || null,
+            market: uploadData.market,
+            renewal_options: uploadData.renewal,
+            key_terms: uploadData.keyTerms,
+            latest_amendment: uploadData.type,
+            amendment_date: uploadData.date || null,
+            status: 'active',
+          }),
+        });
+      } catch (e) {
+        console.error('Failed to create lease:', e);
+      }
+    }
+
+    // Reload from database
+    await loadLeasesFromDB();
+
     setUploadModal(false); setUploadPhase("drop"); setUploadData({}); setUploadFile(null);
-    show(`Saved: Salon #${nl.salon_number} → ${nl.entity} / ${nl.storeName}`);
+    show(`Saved: ${uploadData.storeName || uploadFileName} → ${uploadData.entity || 'portfolio'}`);
   }
 
   // Derived
@@ -310,6 +395,16 @@ export default function App() {
   return (
     <div style={{ fontFamily: "'DM Sans',sans-serif", background: "#0A0E19", color: "#E8E4DD", minHeight: "100vh" }}>
       <div style={{ position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none", background: "radial-gradient(ellipse at 15% 0%,rgba(163,130,82,0.05) 0%,transparent 55%)" }} />
+
+      {/* ═══ LOADING SCREEN ═══ */}
+      {loading && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 9999, background: "#0A0E19", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16 }}>
+          <div style={{ width: 44, height: 44, border: "3px solid rgba(255,255,255,0.05)", borderTop: `3px solid ${gold}`, borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+          <div style={{ color: gold, fontSize: 20, fontFamily: "'Playfair Display',serif" }}>Dogwood Brands</div>
+          <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 12 }}>Loading portfolio from database...</div>
+        </div>
+      )}
+
       <div style={{ position: "relative", zIndex: 1 }}>
 
         <header style={{ padding: "0 28px", height: 58, display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid rgba(255,255,255,0.06)", backdropFilter: "blur(20px)", background: "rgba(10,14,25,0.85)", position: "sticky", top: 0, zIndex: 100 }}>
@@ -318,7 +413,7 @@ export default function App() {
             <div>
               <div style={{ fontSize: 13, fontWeight: 600 }}>Dogwood Brands</div>
               <div style={{ fontSize: 8, color: "rgba(255,255,255,0.25)", textTransform: "uppercase", letterSpacing: "0.15em" }}>
-                Lease Management {memory.loaded && memory.totalStores > 0 ? `· ${memory.totalStores} Salons` : ""}
+                Lease Management {leases.length > 0 ? `· ${leases.length} Locations` : memory.loaded && memory.totalStores > 0 ? `· ${memory.totalStores} Salons` : ""}
               </div>
             </div>
           </div>
@@ -364,8 +459,18 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* DB status */}
+                  {leases.length > 0 && (
+                    <div style={{ background: "rgba(96,165,250,0.06)", border: "1px solid rgba(96,165,250,0.12)", borderRadius: 9, padding: "12px 16px", marginBottom: 20, textAlign: "left" }}>
+                      <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.1em", color: "#60a5fa", marginBottom: 6, fontWeight: 600 }}>💾 Database Connected</div>
+                      <div style={{ fontSize: 12, color: "rgba(255,255,255,0.4)" }}>
+                        {leases.length} locations loaded · {leases.filter(l => l.docs.length > 0).length} with documents · Scan results save automatically
+                      </div>
+                    </div>
+                  )}
+
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 4, flexWrap: "wrap", marginBottom: 24 }}>
-                    {["Find PDFs", "→", "OCR", "→", "Match to Store Directory", "→", "Extract Terms", "→", "Organize"].map((s, i) => (
+                    {["Find PDFs", "→", "OCR", "→", "Match to Store Directory", "→", "Extract Terms", "→", "Save to DB"].map((s, i) => (
                       s === "→" ? <span key={i} style={{ color: "rgba(255,255,255,0.12)", fontSize: 11 }}>→</span> :
                         <span key={i} style={{ padding: "4px 8px", borderRadius: 5, background: "rgba(163,130,82,0.08)", border: "1px solid rgba(163,130,82,0.12)", color: gold, fontSize: 10, fontWeight: 500 }}>{s}</span>
                     ))}
@@ -374,7 +479,7 @@ export default function App() {
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polygon points="5 3 19 12 5 21 5 3" /></svg>
                     Scan My Dropbox
                   </button>
-                  <p style={{ fontSize: 10, color: "rgba(255,255,255,0.15)", marginTop: 8 }}>Nothing moves until you approve</p>
+                  <p style={{ fontSize: 10, color: "rgba(255,255,255,0.15)", marginTop: 8 }}>Results save to database automatically during scan</p>
                 </div>
               )}
 
@@ -390,14 +495,14 @@ export default function App() {
                     <div style={{ display: "flex", gap: 14, textAlign: "right" }}>
                       <div><div style={{ fontSize: 22, fontWeight: 700, color: gold, fontFamily: "'Playfair Display',serif" }}>{fileCount}</div><div style={{ fontSize: 8, color: "rgba(255,255,255,0.2)", textTransform: "uppercase" }}>PDFs</div></div>
                       <div><div style={{ fontSize: 22, fontWeight: 700, color: "#22c55e", fontFamily: "'Playfair Display',serif" }}>{results.length}</div><div style={{ fontSize: 8, color: "rgba(255,255,255,0.2)", textTransform: "uppercase" }}>Classified</div></div>
-                      <div><div style={{ fontSize: 22, fontWeight: 700, color: "#60a5fa", fontFamily: "'Playfair Display',serif" }}>{results.filter(r => r.storeSource === "matched_directory").length}</div><div style={{ fontSize: 8, color: "rgba(255,255,255,0.2)", textTransform: "uppercase" }}>Matched</div></div>
+                      <div><div style={{ fontSize: 22, fontWeight: 700, color: "#60a5fa", fontFamily: "'Playfair Display',serif" }}>{results.filter(r => r.savedToDb).length}</div><div style={{ fontSize: 8, color: "rgba(255,255,255,0.2)", textTransform: "uppercase" }}>Saved</div></div>
                     </div>
                   </div>
                   <div style={{ width: "100%", height: 6, borderRadius: 3, background: "rgba(255,255,255,0.06)", marginBottom: 10, overflow: "hidden" }}>
                     <div style={{ height: "100%", borderRadius: 3, background: `linear-gradient(90deg,${gold},#C4A469)`, transition: "width 0.3s", width: `${Math.min(progress, 100)}%` }} />
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "rgba(255,255,255,0.25)", marginBottom: 18 }}>
-                    <span>{processedCount}/{fileCount} processed · {results.length} classified · {results.filter(r => r.storeSource === "matched_directory").length} matched to directory</span>
+                    <span>{processedCount}/{fileCount} processed · {results.length} classified · {results.filter(r => r.savedToDb).length} saved to DB</span>
                     <span>{Math.round(progress)}%</span>
                   </div>
 
@@ -406,7 +511,7 @@ export default function App() {
                       <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.1em", color: "rgba(34,197,94,0.5)", marginBottom: 6, fontWeight: 600 }}>Live Results</div>
                       {results.slice(-6).map((r, i) => (
                         <div key={i} style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", padding: "3px 0", display: "flex", gap: 6, alignItems: "center" }}>
-                          <span style={{ fontSize: 9, minWidth: 14 }}>{r.storeSource === "matched_directory" ? "🎯" : "⚠️"}</span>
+                          <span style={{ fontSize: 9, minWidth: 14 }}>{r.savedToDb ? "💾" : r.storeSource === "matched_directory" ? "🎯" : "⚠️"}</span>
                           <span style={{ color: (r.document_type || "").includes("Original") ? "#22c55e" : (r.document_type || "").includes("Amendment") ? "#60a5fa" : "#fbbf24", fontWeight: 500, minWidth: 100 }}>{r.document_type}</span>
                           <span style={{ color: gold, minWidth: 50, fontSize: 9 }}>{r.entity}</span>
                           <span style={{ color: "rgba(255,255,255,0.3)", fontFamily: "monospace", fontSize: 9, minWidth: 50 }}>#{r.salon_number || "?"}</span>
@@ -435,16 +540,16 @@ export default function App() {
                     <div>
                       <h2 style={{ fontSize: 22, fontWeight: 300, fontFamily: "'Playfair Display',serif", marginBottom: 4 }}>Scan Complete</h2>
                       <p style={{ fontSize: 12, color: "rgba(255,255,255,0.3)" }}>
-                        {fileCount} PDFs → {results.length} classified → {results.filter(r => r.storeSource === "matched_directory").length} matched to directory
+                        {fileCount} PDFs → {results.length} classified → {results.filter(r => r.savedToDb).length} saved to database
                       </p>
                     </div>
                     <div style={{ display: "flex", gap: 7 }}>
                       <button onClick={() => { setPhase("idle"); setResults([]); setScanLog([]); }} style={{ padding: "7px 14px", borderRadius: 7, fontSize: 11, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "rgba(255,255,255,0.4)", cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>Re-scan</button>
-                      <button onClick={approveResults} style={{ padding: "7px 18px", borderRadius: 7, fontSize: 11, fontWeight: 600, border: "none", cursor: "pointer", fontFamily: "'DM Sans',sans-serif", background: `linear-gradient(135deg,${gold},#8B7040)`, color: "#0A0E19" }}>✓ Approve & Organize</button>
+                      <button onClick={approveResults} style={{ padding: "7px 18px", borderRadius: 7, fontSize: 11, fontWeight: 600, border: "none", cursor: "pointer", fontFamily: "'DM Sans',sans-serif", background: `linear-gradient(135deg,${gold},#8B7040)`, color: "#0A0E19" }}>✓ View Portfolio</button>
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 24 }}>
-                    {[{ l: "Documents", v: results.length }, { l: "Directory Matched", v: results.filter(r => r.storeSource === "matched_directory").length }, { l: "Avg Confidence", v: results.length ? Math.round(results.reduce((a, r) => a + (r.confidence || 0), 0) / results.length) + "%" : "—" }, { l: "Needs Review", v: results.filter(r => (r.confidence || 0) < 85 || r.storeSource === "unmatched").length }].map((m, i) => (
+                    {[{ l: "Documents", v: results.length }, { l: "Saved to DB", v: results.filter(r => r.savedToDb).length }, { l: "Avg Confidence", v: results.length ? Math.round(results.reduce((a, r) => a + (r.confidence || 0), 0) / results.length) + "%" : "—" }, { l: "Needs Review", v: results.filter(r => (r.confidence || 0) < 85 || !r.savedToDb).length }].map((m, i) => (
                       <div key={i} style={{ flex: "1 1 150px", background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 9, padding: "14px 16px" }}>
                         <div style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 3 }}>{m.l}</div>
                         <div style={{ fontSize: 22, fontWeight: 700, color: gold, fontFamily: "'Playfair Display',serif" }}>{m.v}</div>
@@ -466,7 +571,7 @@ export default function App() {
                           <div key={store} style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)", borderRadius: 9, marginBottom: 6, overflow: "hidden" }}>
                             <div style={{ padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                                <span style={{ fontSize: 9 }}>{sDocs[0].storeSource === "matched_directory" ? "🎯" : "⚠️"}</span>
+                                <span style={{ fontSize: 9 }}>{sDocs[0].savedToDb ? "💾" : sDocs[0].storeSource === "matched_directory" ? "🎯" : "⚠️"}</span>
                                 <span style={{ fontSize: 10, fontFamily: "monospace", color: gold }}>#{store}</span>
                                 <span style={{ fontSize: 11, fontWeight: 600 }}>{sDocs[0].storeName || sDocs[0].store_name || ""}</span>
                                 <span style={{ fontSize: 10, color: "rgba(255,255,255,0.2)" }}>{sDocs[0].property_address}</span>
@@ -501,17 +606,21 @@ export default function App() {
           {/* ═══ PORTFOLIO ═══ */}
           {view === "portfolio" && !selectedLease && (
             <div>
-              {leases.length === 0 ? (
+              {leases.length === 0 && !loading ? (
                 <div style={{ textAlign: "center", padding: "70px 0", color: "rgba(255,255,255,0.25)" }}>
-                  <p style={{ fontSize: 14, marginBottom: 12 }}>No leases scanned yet.</p>
-                  <button onClick={() => setView("scan")} style={{ padding: "8px 20px", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none", cursor: "pointer", fontFamily: "'DM Sans',sans-serif", background: `linear-gradient(135deg,${gold},#8B7040)`, color: "#0A0E19" }}>Go to Scanner</button>
+                  <p style={{ fontSize: 14, marginBottom: 12 }}>No leases in database yet.</p>
+                  <p style={{ fontSize: 11, color: "rgba(255,255,255,0.15)", marginBottom: 20 }}>Scan your Dropbox or upload documents to get started.</p>
+                  <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                    <button onClick={() => setView("scan")} style={{ padding: "8px 20px", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none", cursor: "pointer", fontFamily: "'DM Sans',sans-serif", background: `linear-gradient(135deg,${gold},#8B7040)`, color: "#0A0E19" }}>Go to Scanner</button>
+                    <button onClick={() => { setUploadModal(true); setUploadPhase("drop") }} style={{ padding: "8px 20px", borderRadius: 7, fontSize: 12, border: "1px solid rgba(255,255,255,0.1)", background: "transparent", color: "rgba(255,255,255,0.5)", cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>Upload Document</button>
+                  </div>
                 </div>
-              ) : (
+              ) : leases.length > 0 && (
                 <>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 22 }}>
                     <div>
                       <h1 style={{ fontSize: 24, fontWeight: 300, fontFamily: "'Playfair Display',serif", marginBottom: 3 }}>Lease Portfolio</h1>
-                      <p style={{ fontSize: 11, color: "rgba(255,255,255,0.3)" }}>{leases.length} locations · {entities.length} entities</p>
+                      <p style={{ fontSize: 11, color: "rgba(255,255,255,0.3)" }}>{leases.length} locations · {entities.length} entities · Data saved in database</p>
                     </div>
                     <div style={{ display: "flex", gap: 7 }}>
                       <select value={selectedEntity} onChange={e => setSelectedEntity(e.target.value)} style={{ padding: "6px 10px", borderRadius: 6, fontSize: 10, border: "1px solid rgba(255,255,255,0.08)", background: "rgba(255,255,255,0.03)", color: "rgba(255,255,255,0.5)", fontFamily: "'DM Sans',sans-serif", outline: "none" }}>
@@ -542,7 +651,7 @@ export default function App() {
                         <div style={{ borderRadius: 10, border: "1px solid rgba(255,255,255,0.06)", overflow: "hidden" }}>
                           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
                             <thead><tr style={{ background: "rgba(255,255,255,0.03)" }}>
-                              {["Salon #", "Name", "Address", "Landlord", "Rent", "All-In", "SqFt", "LED", "Status"].map(h => (
+                              {["Salon #", "Name", "Address", "Landlord", "Rent", "All-In", "SqFt", "LED", "Docs", "Status"].map(h => (
                                 <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontSize: 9, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", color: "rgba(255,255,255,0.25)", borderBottom: "1px solid rgba(255,255,255,0.05)", whiteSpace: "nowrap" }}>{h}</th>
                               ))}
                             </tr></thead>
@@ -556,6 +665,7 @@ export default function App() {
                                 <td style={{ padding: "10px", color: "rgba(255,255,255,0.4)" }}>{l.rent ? fmt(l.rent + (l.cam || 0)) : "—"}</td>
                                 <td style={{ padding: "10px", color: "rgba(255,255,255,0.35)" }}>{l.sqft ? l.sqft.toLocaleString() : "—"}</td>
                                 <td style={{ padding: "10px", color: "rgba(255,255,255,0.4)", fontSize: 10 }}>{l.led || l.endDate || "—"}</td>
+                                <td style={{ padding: "10px", color: "rgba(255,255,255,0.3)", fontSize: 10 }}>{l.docs.length || l.documentCount || 0}</td>
                                 <td style={{ padding: "10px" }}><Badge status={l.status} /></td>
                               </tr>
                             ))}</tbody>
@@ -593,7 +703,12 @@ export default function App() {
                 </div>
                 <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, padding: 20 }}>
                   <div style={{ fontSize: 9, textTransform: "uppercase", letterSpacing: "0.1em", color: "rgba(255,255,255,0.3)", marginBottom: 14, fontWeight: 600 }}>Documents ({(selectedLease.docs || []).length})</div>
-                  {(selectedLease.docs || []).map((d, i) => (
+                  {(selectedLease.docs || []).length === 0 ? (
+                    <div style={{ textAlign: "center", padding: "20px 0", color: "rgba(255,255,255,0.15)", fontSize: 11 }}>
+                      <p>No documents scanned yet for this location.</p>
+                      <button onClick={() => { setUploadModal(true); setUploadPhase("drop") }} style={{ marginTop: 10, padding: "6px 14px", borderRadius: 6, fontSize: 10, border: "1px solid rgba(255,255,255,0.1)", background: "transparent", color: gold, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>+ Upload Document</button>
+                    </div>
+                  ) : (selectedLease.docs || []).map((d, i) => (
                     <div key={i} style={{ padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.03)" }}>
                       <div style={{ display: "flex", justifyContent: "space-between" }}>
                         <span style={{ fontSize: 11, fontWeight: 500, color: (d.type || "").includes("Original") ? "#22c55e" : "#60a5fa" }}>{d.type}</span>
@@ -620,7 +735,7 @@ export default function App() {
                   </h2>
                   {uploadPhase === "review" && uploadData.confidence > 0 && (
                     <p style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginTop: 2 }}>
-                      AI confidence: {uploadData.confidence}% · {uploadData.storeSource === "matched_directory" ? "🎯 Matched to directory" : "⚠️ Manual match needed"}
+                      AI confidence: {uploadData.confidence}% {uploadData._savedToDb ? "· 💾 Saved to database" : "· ⚠️ Review needed"}
                     </p>
                   )}
                 </div>
@@ -632,22 +747,22 @@ export default function App() {
                     onDragOver={e => { e.preventDefault(); setDragOver(true) }} onDragLeave={() => setDragOver(false)}
                     onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f) handleUpload(f) }}
                     onClick={() => fileRef.current?.click()}>
-                    <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (f) handleUpload(f) }} />
+                    <input ref={fileRef} type="file" accept=".pdf,.png,.jpg,.jpeg" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (f) handleUpload(f) }} />
                     <div style={{ fontSize: 13, fontWeight: 500, color: "rgba(255,255,255,0.5)", marginBottom: 4 }}>Drop your document here</div>
-                    <div style={{ fontSize: 10, color: "rgba(255,255,255,0.2)" }}>AI matches to {memory.totalStores}-salon directory automatically</div>
+                    <div style={{ fontSize: 10, color: "rgba(255,255,255,0.2)" }}>PDF, PNG, or JPG · OCR + AI classification + auto-save to database</div>
                   </div>
                 )}
                 {uploadPhase === "processing" && (
                   <div style={{ textAlign: "center", padding: "24px 0" }}>
                     <div style={{ width: 44, height: 44, margin: "0 auto 16px", border: "3px solid rgba(255,255,255,0.05)", borderTop: `3px solid ${gold}`, borderRadius: "50%", animation: "spin 1s linear infinite" }} />
                     <div style={{ fontSize: 12, color: "rgba(255,255,255,0.5)" }}>{uploadFileName}</div>
-                    <div style={{ fontSize: 10, color: "rgba(255,255,255,0.2)", marginTop: 4 }}>OCR → matching to {memory.totalStores}-store directory → extracting terms...</div>
+                    <div style={{ fontSize: 10, color: "rgba(255,255,255,0.2)", marginTop: 4 }}>OCR → AI classification → saving to database...</div>
                   </div>
                 )}
                 {uploadPhase === "review" && (
                   <div>
+                    {uploadData._savedToDb && <div style={{ padding: "8px 12px", borderRadius: 6, marginBottom: 14, background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.15)", fontSize: 10, color: "#22c55e" }}>💾 Already saved to database. Edit fields below if needed, then click Save to update.</div>}
                     {uploadData.classNotes && <div style={{ padding: "8px 12px", borderRadius: 6, marginBottom: 14, background: "rgba(163,130,82,0.08)", border: "1px solid rgba(163,130,82,0.15)", fontSize: 10, color: "rgba(163,130,82,0.8)" }}><b>AI:</b> {uploadData.classNotes}</div>}
-                    {uploadData.suggestedFolder && <div style={{ padding: "6px 12px", borderRadius: 6, marginBottom: 14, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)", fontSize: 9, color: "rgba(255,255,255,0.25)", fontFamily: "monospace" }}>→ {uploadData.suggestedFolder}{uploadData.suggestedFilename}</div>}
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                       {[
                         { k: "entity", l: "Entity", select: memory.entities.length > 0 ? [...memory.entities, "Other"] : undefined },
@@ -675,7 +790,7 @@ export default function App() {
                     </div>
                     <div style={{ display: "flex", gap: 7, justifyContent: "flex-end", marginTop: 18, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.05)" }}>
                       <button onClick={() => { setUploadModal(false); setUploadPhase("drop") }} style={{ padding: "8px 16px", borderRadius: 7, fontSize: 11, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "rgba(255,255,255,0.4)", cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>Cancel</button>
-                      <button onClick={saveUpload} style={{ padding: "8px 20px", borderRadius: 7, fontSize: 11, fontWeight: 600, border: "none", cursor: "pointer", fontFamily: "'DM Sans',sans-serif", background: `linear-gradient(135deg,${gold},#8B7040)`, color: "#0A0E19" }}>Save & Organize</button>
+                      <button onClick={saveUpload} style={{ padding: "8px 20px", borderRadius: 7, fontSize: 11, fontWeight: 600, border: "none", cursor: "pointer", fontFamily: "'DM Sans',sans-serif", background: `linear-gradient(135deg,${gold},#8B7040)`, color: "#0A0E19" }}>{uploadData._savedToDb ? "Update & Close" : "Save & Organize"}</button>
                     </div>
                   </div>
                 )}

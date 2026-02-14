@@ -1,8 +1,7 @@
 // src/app/api/db/seed/route.js
 // Import your 58-store directory from store-memory.json into the database
-// Run once after initializing the database
 import sql from '@/lib/db';
-import storeMemory from '@/../data/store-memory.json';
+import storeMemory from '../../.././../../data/store-memory.json';
 
 export async function POST() {
   try {
@@ -10,12 +9,14 @@ export async function POST() {
     let skipped = 0;
     const errors = [];
 
-    for (const store of storeMemory.stores || storeMemory) {
+    for (const store of storeMemory) {
       try {
+        const storeNum = String(store.salon_number);
+
         // Check if this store already exists
         const existing = await sql`
           SELECT id FROM leases 
-          WHERE store_number = ${store.store_number || store.storeNumber}
+          WHERE salon_number = ${storeNum}
           LIMIT 1
         `;
 
@@ -24,11 +25,6 @@ export async function POST() {
           continue;
         }
 
-        // Parse the address into components
-        const fullAddress = store.address || '';
-        const addressParts = fullAddress.split(',').map(s => s.trim());
-        const stateZip = (addressParts[addressParts.length - 1] || '').split(' ');
-        
         await sql`
           INSERT INTO leases (
             store_number,
@@ -43,31 +39,32 @@ export async function POST() {
             entity,
             led_date,
             annual_sales_2024,
-            status
+            status,
+            notes
           ) VALUES (
-            ${store.store_number || store.storeNumber},
-            ${store.location_name || store.name || store.store_name},
-            ${store.salon_number || store.salonNumber},
+            ${store.internal_name || storeNum},
+            ${store.store_name ? (store.concept || 'SUPERCUTS') + ' - ' + store.store_name : null},
+            ${storeNum},
             ${store.address},
-            ${store.city || addressParts[1] || null},
-            ${store.state || (stateZip.length >= 2 ? stateZip[0] : null)},
-            ${store.zip || (stateZip.length >= 2 ? stateZip[1] : null)},
-            ${store.shopping_center || store.shoppingCenter},
-            ${store.market},
+            ${store.city},
+            ${store.state},
+            ${store.zip},
+            ${store.shopping_center},
+            ${store.state === 'NV' ? 'Las Vegas' : store.state === 'AZ' ? 'Phoenix' : 'Southern California'},
             ${store.entity},
-            ${store.led_date || store.led || null},
-            ${store.annual_sales_2024 || store.sales_2024 || null},
-            'active'
+            ${store.led || null},
+            ${store.sales_2024 || null},
+            'active',
+            ${store.phone ? 'Phone: ' + store.phone : null}
           )
         `;
 
         imported++;
       } catch (storeError) {
-        errors.push({ store: store.store_number, error: storeError.message });
+        errors.push({ store: store.salon_number, error: storeError.message });
       }
     }
 
-    // Get final count
     const count = await sql`SELECT COUNT(*) AS total FROM leases`;
 
     return Response.json({
